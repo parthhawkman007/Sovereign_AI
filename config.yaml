@@ -1,0 +1,5 @@
+models:
+  reasoning: "phi4-mini"
+  coding: "qwen2.5-coder:3b"
+  vision: "gemma3:4b"
+  embedding: "nomic-embed-text"

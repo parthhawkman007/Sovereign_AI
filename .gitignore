@@ -1,0 +1,7 @@
+venv/
+__pycache__/
+trace.log
+audit.log
+local_faiss_index/
+.env
+.DS_Store

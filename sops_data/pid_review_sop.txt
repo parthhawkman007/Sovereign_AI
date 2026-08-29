@@ -1,0 +1,17 @@
+STANDARD OPERATING PROCEDURE: PIPING & INSTRUMENTATION (P&ID) REVIEWS
+
+1. OVERVIEW
+This document outlines the standard process for reviewing and approving changes to Piping & Instrumentation Diagrams (P&IDs) within the refinery.
+
+2. SECURITY CLEARANCE
+All P&ID documents are highly classified. Review must happen on air-gapped workstations only. Do not upload drawings to external cloud services.
+
+3. CALCULATION REQUIREMENTS
+When a pipe diameter is modified, a pipe stress calculation must be performed. The maximum allowable stress for standard carbon steel piping in Sector 4 is 20,000 psi. If calculations exceed this, a secondary support structure is required.
+
+4. APPROVAL WORKFLOW
+Any changes affecting safety-critical systems must be documented in an "Approval Note". The note must include:
+- The system affected.
+- The calculated stress values.
+- Justification for the change.
+The generated Approval Note must be saved locally and physically signed by the Shift Supervisor.
