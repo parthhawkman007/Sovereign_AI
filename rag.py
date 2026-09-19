@@ -11,9 +11,30 @@ import openpyxl
 import email
 from pypdf import PdfReader
 from docx import Document as DocxDocument
+from pptx import Presentation
 from model_router import router
 
-logging.basicConfig(filename='audit.log', level=logging.INFO, format='%(asctime)s - %(message)s')
+logging.basicConfig(filename=os.path.join("workspace", "audit.log"), level=logging.INFO, format='%(asctime)s - %(message)s')
+
+# FIX 7 — Audit log rotation: cap at 10 MB, keep 3 backups.
+# Replaces the unbounded append-only log with a rotating handler so
+# audit.log never exceeds 10 MB (older entries roll to audit.log.1/.2/.3).
+try:
+    from logging.handlers import RotatingFileHandler as _RFH
+    _audit_log_path = os.path.join("workspace", "audit.log")
+    os.makedirs("workspace", exist_ok=True)
+    _rfh = _RFH(
+        _audit_log_path,
+        maxBytes=10 * 1024 * 1024,  # 10 MB per file
+        backupCount=3,               # keep audit.log.1, .2, .3
+        encoding="utf-8",
+    )
+    _rfh.setLevel(logging.INFO)
+    _rfh.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+    logging.getLogger().addHandler(_rfh)
+except Exception as _e:
+    logging.warning(f"[RAG] Could not attach RotatingFileHandler: {_e}")
+
 
 def split_text(text, chunk_size=500, chunk_overlap=50):
     chunks = []
@@ -25,9 +46,9 @@ def split_text(text, chunk_size=500, chunk_overlap=50):
     return chunks
 
 class LocalKnowledgeBase:
-    def __init__(self, domain="general"):
+    def __init__(self, domain="general", persist_dir=None):
         self.domain = domain
-        self.persist_dir = f"local_faiss_index_{domain}"
+        self.persist_dir = persist_dir or os.path.join("workspace", "vector_databases", f"local_faiss_index_{domain}")
         self.embeddings = OllamaEmbeddings(model=router.get_embedding_model())
         self.graph_file = os.path.join(self.persist_dir, "entity_graph.json")
         self.bm25_file = os.path.join(self.persist_dir, "bm25_index.pkl")
@@ -77,9 +98,20 @@ class LocalKnowledgeBase:
 
     def _load_pdf(self, file_path):
         try:
-            reader = PdfReader(file_path)
-            content = "\n".join([page.extract_text() for page in reader.pages]).strip()
-            return [Document(page_content=content, metadata={"source": os.path.basename(file_path), "role": self._get_role(file_path)})]
+            from tools import extract_pdf_pages
+            pages = extract_pdf_pages(file_path)
+            docs = []
+            for p in pages:
+                if p["text"].strip():
+                    docs.append(Document(
+                        page_content=p["text"],
+                        metadata={
+                            "source": os.path.basename(file_path),
+                            "page": p["page"],
+                            "role": self._get_role(file_path)
+                        }
+                    ))
+            return docs
         except Exception as e:
             print(f"Failed to load pdf {file_path}: {e}")
             return []
@@ -87,8 +119,16 @@ class LocalKnowledgeBase:
     def _load_docx(self, file_path):
         try:
             doc = DocxDocument(file_path)
-            content = "\n".join([p.text for p in doc.paragraphs]).strip()
-            return [Document(page_content=content, metadata={"source": os.path.basename(file_path), "role": self._get_role(file_path)})]
+            content = []
+            for p in doc.paragraphs:
+                if p.text.strip():
+                    content.append(p.text)
+            for table in doc.tables:
+                for row in table.rows:
+                    row_data = [cell.text.replace("\n", " ").strip() for cell in row.cells]
+                    content.append(" | ".join(row_data))
+            full_content = "\n".join(content).strip()
+            return [Document(page_content=full_content, metadata={"source": os.path.basename(file_path), "role": self._get_role(file_path)})]
         except Exception as e:
             print(f"Failed to load docx {file_path}: {e}")
             return []
@@ -102,6 +142,20 @@ class LocalKnowledgeBase:
             print(f"Failed to load txt {file_path}: {e}")
             return []
 
+    def _load_pptx(self, file_path):
+        try:
+            prs = Presentation(file_path)
+            content = []
+            for slide in prs.slides:
+                for shape in slide.shapes:
+                    if hasattr(shape, "text"):
+                        content.append(shape.text)
+            text_content = "\n".join(content).strip()
+            return [Document(page_content=text_content, metadata={"source": os.path.basename(file_path), "role": self._get_role(file_path)})]
+        except Exception as e:
+            print(f"Failed to load pptx {file_path}: {e}")
+            return []
+
     def ingest_documents(self, data_dir: str):
         print(f"[{self.domain.upper()}] Ingesting documents from {data_dir}...")
         documents = []
@@ -109,14 +163,16 @@ class LocalKnowledgeBase:
             os.makedirs(data_dir)
             return
 
-        for filename in os.listdir(data_dir):
-            file_path = os.path.join(data_dir, filename)
-            ext = file_path.lower().split('.')[-1]
-            if ext == 'xlsx': documents.extend(self._load_excel(file_path))
-            elif ext == 'eml': documents.extend(self._load_eml(file_path))
-            elif ext == 'pdf': documents.extend(self._load_pdf(file_path))
-            elif ext == 'docx': documents.extend(self._load_docx(file_path))
-            elif ext == 'txt': documents.extend(self._load_txt(file_path))
+        for root, _, files in os.walk(data_dir):
+            for filename in files:
+                file_path = os.path.join(root, filename)
+                ext = file_path.lower().split('.')[-1]
+                if ext == 'xlsx': documents.extend(self._load_excel(file_path))
+                elif ext == 'eml': documents.extend(self._load_eml(file_path))
+                elif ext == 'pdf': documents.extend(self._load_pdf(file_path))
+                elif ext == 'docx': documents.extend(self._load_docx(file_path))
+                elif ext == 'txt': documents.extend(self._load_txt(file_path))
+                elif ext in ['ppt', 'pptx']: documents.extend(self._load_pptx(file_path))
 
         if not documents:
             return
@@ -214,11 +270,49 @@ class LocalKnowledgeBase:
         if not final_results and not graph_context:
             return f"[{self.domain.upper()}] No relevant information found."
             
-        context = "\n\n".join([f"Source: {doc.metadata.get('source', 'Unknown')} (Role: {doc.metadata.get('role', 'unknown')})\nContent: {doc.page_content}" for doc in final_results])
+
+        # FIX 6 — Prompt Injection Defense (block, don't just flag)
+        # If a retrieved chunk contains injection commands, replace the entire
+        # chunk content with a warning. The malicious instruction text is NOT
+        # forwarded to the LLM.
+        _INJECTION_PATTERNS = [
+            "ignore previous instructions",
+            "ignore system instructions",
+            "disregard previous",
+            "forget previous instructions",
+            "you are now",
+            "new instructions:",
+        ]
+        sanitized_results = []
+        for doc in final_results:
+            text = doc.page_content
+            lower_text = text.lower()
+            if any(pattern in lower_text for pattern in _INJECTION_PATTERNS):
+                logging.warning(
+                    f"[SECURITY] Prompt injection pattern detected in source "
+                    f"'{doc.metadata.get('source', 'Unknown')}'. Chunk blocked."
+                )
+                # Replace chunk content entirely — do NOT forward the injection text
+                text = (
+                    f"[SECURITY: PROMPT INJECTION DETECTED AND BLOCKED] "
+                    f"A chunk from source '{doc.metadata.get('source', 'Unknown')}' "
+                    f"contained instruction-override text and has been redacted."
+                )
+            sanitized_results.append((doc, text))
+
+        context = "\n\n".join([
+            f"<EVIDENCE source=\"{doc.metadata.get('source', 'Unknown')}\" "
+            f"role=\"{doc.metadata.get('role', 'unknown')}\">\n{text}\n</EVIDENCE>"
+            for doc, text in sanitized_results
+        ])
         context += graph_context
-        
-        logging.info(f"USER:{user_role} | DOMAIN:{self.domain} | QUERY:{query} | RETRIEVED_SOURCES:{[d.metadata.get('source') for d in final_results]}")
+
+        logging.info(
+            f"USER:{user_role} | DOMAIN:{self.domain} | QUERY:{query} | "
+            f"RETRIEVED_SOURCES:{[d.metadata.get('source') for d in final_results]}"
+        )
         return context
+
 
 if __name__ == "__main__":
     for domain, folder in [("engineering", "data_engineering"), ("commercial", "data_commercial"), ("compliance", "data_compliance")]:

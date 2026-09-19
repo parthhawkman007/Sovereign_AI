@@ -1,8 +1,18 @@
 import requests
+import yaml
+import os
 
 class ModelRouter:
     def __init__(self):
         self.models = self._fetch_installed_models()
+        self.config = self._load_config()
+
+    def _load_config(self):
+        config_path = os.path.join(os.path.dirname(__file__), "config.yaml")
+        if os.path.exists(config_path):
+            with open(config_path, "r") as f:
+                return yaml.safe_load(f).get("models", {})
+        return {}
 
     def _fetch_installed_models(self):
         try:
@@ -13,29 +23,71 @@ class ModelRouter:
             pass
         return []
 
-    def get_reasoning_model(self, fallback="phi4-mini"):
+    def get_reasoning_model(self, fallback=None):
+        fallback = fallback or self.config.get("reasoning", "phi4-mini")
         for m in self.models:
             if "phi4" in m or "llama3" in m or "mixtral" in m:
                 return m
         return fallback
 
-    def get_coding_model(self, fallback="qwen2.5-coder:3b"):
+    def get_coding_model(self, fallback=None):
+        fallback = fallback or self.config.get("coding", "qwen2.5-coder:3b")
         for m in self.models:
             if "coder" in m or "starcoder" in m or "deepseek-coder" in m:
                 return m
         return self.get_reasoning_model(fallback=fallback)
 
-    def get_vision_model(self, fallback="gemma3:4b"):
+    def get_vision_model(self, fallback=None):
+        fallback = fallback or self.config.get("vision", "gemma3:4b")
         for m in self.models:
             if "gemma3" in m or "llava" in m or "bakllava" in m:
                 return m
         return fallback
 
-    def get_embedding_model(self, fallback="nomic-embed-text"):
+    def get_embedding_model(self, fallback=None):
+        fallback = fallback or self.config.get("embedding", "nomic-embed-text")
         for m in self.models:
             if "embed" in m:
                 return m
         return fallback
+
+    def get_document_model(self, fallback=None):
+        fallback = fallback or self.config.get("document", "qwen2.5:1.5b")
+        for m in self.models:
+            if "qwen2.5" in m and "coder" not in m:
+                return m
+            if "llama" in m:
+                return m
+        return fallback
+
+    def resolve_model(self, requested_name: str) -> str:
+        if not requested_name:
+            return self.get_reasoning_model()
+            
+        req = str(requested_name).strip().lower()
+
+        # Semantic overrides to protect specific model roles
+        if req == "qwen" or "coder" in req or "code" in req:
+            return self.get_coding_model()
+        if "vision" in req or "gemma" in req or "image" in req:
+            return self.get_vision_model()
+        if req == "document":
+            return self.get_document_model()
+        if req == "phi" or "reason" in req:
+            return self.get_reasoning_model()
+
+        # 1. Exact match
+        for m in self.models:
+            if m.lower() == req:
+                return m
+                
+        # 2. Match without tag or prefix match
+        base_req = req.split(':')[0]
+        for m in self.models:
+            if m.lower().split(':')[0] == base_req or req in m.lower():
+                return m
+            
+        return self.get_reasoning_model()
 
     def get_model_descriptions(self):
         """Returns a prompt-friendly string of available models and their capabilities."""
