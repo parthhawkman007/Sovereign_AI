@@ -1,10 +1,10 @@
 # Sovereign AI Workbench
 
-A powerful, 100% air-gapped AI workspace tailored for enterprise and engineering tasks. The Sovereign AI Workbench uses local models to ensure privacy, and integrates multiple domain-specific knowledge bases alongside AI-driven file generation tools.
+A powerful AI workspace tailored for enterprise and engineering tasks featuring local execution within the organization's controlled environment. The Sovereign AI Workbench uses local models to ensure privacy, and integrates multiple domain-specific knowledge bases alongside AI-driven file generation tools.
 
 ## Features
 
-- **100% Air-Gapped**: Runs entirely locally using Ollama.
+- **Local Execution**: Runs entirely locally using Ollama within the organization's controlled environment.
 - **AI Agent**: Intelligent agent powered by LangGraph that can chat, reason, write code, and analyze documents.
 - **RAG (Retrieval-Augmented Generation)**: Domain-specific knowledge bases (Engineering, Commercial, Compliance).
 - **Tooling**: Built-in tools for extracting tables from images, creating Excel reports, Word Approval Notes, and Powerpoint presentations.
@@ -21,7 +21,7 @@ You also need to pull the necessary models via Ollama. Open your terminal and ru
 ```bash
 ollama run phi4-mini
 ollama run qwen2.5-coder:3b
-ollama run gemma3:4b
+ollama run granite3.2-vision:2b
 ollama run nomic-embed-text
 ```
 *(Note: depending on the exact models configured, the system uses these local models for reasoning, coding, vision, and embeddings respectively)*

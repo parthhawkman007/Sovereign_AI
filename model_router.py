@@ -38,9 +38,9 @@ class ModelRouter:
         return self.get_reasoning_model(fallback=fallback)
 
     def get_vision_model(self, fallback=None):
-        fallback = fallback or self.config.get("vision", "gemma3:4b")
+        fallback = fallback or self.config.get("vision", "granite3.2-vision:2b")
         for m in self.models:
-            if "gemma3" in m or "llava" in m or "bakllava" in m:
+            if "granite3.2-vision" in m or "granite" in m or "vision" in m:
                 return m
         return fallback
 
@@ -52,13 +52,7 @@ class ModelRouter:
         return fallback
 
     def get_document_model(self, fallback=None):
-        fallback = fallback or self.config.get("document", "qwen2.5:1.5b")
-        for m in self.models:
-            if "qwen2.5" in m and "coder" not in m:
-                return m
-            if "llama" in m:
-                return m
-        return fallback
+        return self.get_reasoning_model(fallback=fallback)
 
     def resolve_model(self, requested_name: str) -> str:
         if not requested_name:
@@ -69,7 +63,7 @@ class ModelRouter:
         # Semantic overrides to protect specific model roles
         if req == "qwen" or "coder" in req or "code" in req:
             return self.get_coding_model()
-        if "vision" in req or "gemma" in req or "image" in req:
+        if "vision" in req or "granite" in req or "image" in req:
             return self.get_vision_model()
         if req == "document":
             return self.get_document_model()
@@ -93,13 +87,13 @@ class ModelRouter:
         """Returns a prompt-friendly string of available models and their capabilities."""
         if not self.models:
             # Mock models if Ollama isn't running
-            return "- phi4-mini: Fast, general reasoning and text summarization.\n- qwen2.5-coder:3b: Specialized for writing Python code and calculations.\n- gemma3:4b: Multimodal vision model for analyzing images and scans."
+            return "- phi4-mini: Fast, general reasoning and text summarization.\n- qwen2.5-coder:3b: Specialized for writing Python code and calculations.\n- granite3.2-vision:2b: Multimodal vision model for analyzing images, scans, and P&IDs."
         
         desc = ""
         for m in self.models:
             if "coder" in m or "starcoder" in m:
                 desc += f"- {m}: Specialized for writing Python code and calculations.\n"
-            elif "gemma3" in m or "llava" in m:
+            elif "granite" in m or "vision" in m or "llava" in m:
                 desc += f"- {m}: Multimodal vision model for analyzing images, scans, and P&IDs.\n"
             elif "embed" in m:
                 pass # Don't expose embedding models to the multiplexer
