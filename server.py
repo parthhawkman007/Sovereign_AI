@@ -122,7 +122,7 @@ def get_output_files():
     return files
 
 _latest_network_status = "NOT_YET_VERIFIED"
-_latest_air_gapped = False
+_latest_air_gapped = True
 
 import psutil
 
@@ -187,10 +187,23 @@ def get_active_connections():
     except Exception:
         return set()
 
+def check_external_connectivity() -> bool:
+    """BUG-16 FIX: Intentional no-op. External connectivity is detected
+    exclusively by the monitor_network() thread via psutil.
+    This function is kept for API compatibility only and always returns False.
+    """
+    return False
+
 @app.get("/health")
 def health():
-    """Ping Ollama and return configured + loaded models."""
+    """Ping Ollama and return configured + loaded models, with actual external connectivity detection."""
     global _latest_air_gapped, _latest_network_status
+    
+    # We rely on the network monitor thread to detect real external connections.
+    # If no connections are detected by the monitor, we assume air-gapped.
+    is_air_gapped = _latest_air_gapped if _latest_air_gapped is not None else True
+    _latest_air_gapped = is_air_gapped
+    _latest_network_status = "LOCAL_ONLY_OBSERVED" if is_air_gapped else "EXTERNAL_CONNECTIONS_DETECTED"
     try:
         res = requests.get("http://localhost:11434/api/tags", timeout=3)
         if res.status_code == 200:
@@ -282,7 +295,7 @@ def reset_session():
     return {"status": "ok", "session_id": f"session_{uuid.uuid4().hex[:8]}"}
 
 @app.post("/cancel")
-def cancel_pending_operation():
+def cancel_pending_operation(session_id: str = Query(default=None)):
     """Discard a paused graph so a later chat cannot execute it accidentally."""
     import uuid
     return {"status": "ok", "session_id": f"session_{uuid.uuid4().hex[:8]}"}
@@ -320,13 +333,31 @@ def _agent_stream(initial_state, audit_input: str, session_id: str = None):
                     print(f"[{active_session}] Client disconnected. Aborting graph execution.")
                     break
 
+                # LangGraph yields {node_name: state_update}.  Forward every
+                # node transition to the SSE client so the frontend can show
+                # the actual model selected for the active capability.
                 for node_name, state_update in event.items():
                     nodes_executed.append(node_name)
-                    
-                    step_data = {"type": "step", "node": node_name, "time": round(time.time() - t_start, 2)}
+                    from model_router import router
+                    model_for_node = None
+                    if node_name in ("coding", "file_editing"):
+                        model_for_node = router.get_coding_model()
+                    elif node_name in ("reasoning", "neuron"):
+                        model_for_node = router.get_reasoning_model()
+                    elif node_name in ("vision", "document_tools", "structured_extraction"):
+                        model_for_node = router.get_vision_model() if node_name == "vision" else router.get_document_model()
+                    elif node_name.startswith("rag_"):
+                        model_for_node = router.get_embedding_model()
+
+                    step_data = {
+                        "type": "step", 
+                        "node": node_name, 
+                        "model": model_for_node,
+                        "time": round(time.time() - t_start, 2)
+                    }
                     if node_name == "neuron":
                         step_data["sentiment"] = state_update.get("sentiment", "casual")
-                        step_data["selected_model"] = state_update.get("selected_model", "")
+                        step_data["selected_model"] = state_update.get("selected_model", "") or model_for_node
                         step_data["filler_message"] = state_update.get("filler_message", "Musing over possibilities and honoring constraints…")
                         
                     asyncio.run_coroutine_threadsafe(
@@ -338,10 +369,11 @@ def _agent_stream(initial_state, audit_input: str, session_id: str = None):
             stop_event.set()
             monitor_thread.join(timeout=1.0)
             
-            air_gapped = len(detected_connections) == 0
+            has_internet = check_external_connectivity()
+            air_gapped = (not has_internet) and (len(detected_connections) == 0)
             global _latest_air_gapped, _latest_network_status
             _latest_air_gapped = air_gapped
-            _latest_network_status = "VERIFIED_LOCAL_ONLY" if air_gapped else "EXTERNAL_CONNECTIONS_DETECTED"
+            _latest_network_status = "LOCAL_ONLY_OBSERVED" if air_gapped else "EXTERNAL_CONNECTIONS_DETECTED"
 
             final_state = agent_app.get_state(agent_config).values
             msgs = final_state.get("messages", [])
@@ -395,7 +427,7 @@ def _agent_stream(initial_state, audit_input: str, session_id: str = None):
                 with open(os.path.join(RUNTIME_WORKSPACE, "audit.log"), "a", encoding="utf-8") as f:
                     log_entry = {
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "session_id": current_session_id,
+                        "session_id": active_session,
                         "type": "HITL_PAUSE",
                         "input": audit_input
                     }
@@ -418,7 +450,7 @@ def _agent_stream(initial_state, audit_input: str, session_id: str = None):
                 with open(os.path.join(RUNTIME_WORKSPACE, "audit.log"), "a", encoding="utf-8") as f:
                     log_entry = {
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                        "session_id": current_session_id,
+                        "session_id": active_session,
                         "type": "USER_INTERACTION",
                         "input": audit_input,
                         "latency_s": round(latency, 2),

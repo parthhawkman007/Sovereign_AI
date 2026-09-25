@@ -1,7 +1,71 @@
-venv/
+# Python
 __pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Large workspace files (user uploads/outputs - not for repo)
+workspace/uploads/
+workspace/processed/
+workspace/vector_databases/
+workspace/sessions/
+workspace/outputs/
+workspace/audit.log
+workspace/.backups/
+
+# Databases
+database.db
+*.db
+*.sqlite3
+
+# Logs and traces
+*.log
 trace.log
-audit.log
-local_faiss_index/
-.env
+workspace/audit.log
+
+# Large test/data files
+test_pdfs/
+vector_databases/
+test_big.txt
+validated_equipment.csv
+
+# Temp / scratch files
+preflight.py
+system_test.py
+test_echo_fix.py
+run_all_tests.py
+gen_report.py
+unload_ollama.py
+failure_analysis.py
+
+# Binary / build outputs
+*.docx
+*.pdf
+*.xlsx
+*.pptx
+Sovereign_AI_Workbench_Project_Report.docx
+pythonlearn.pdf
+
+# OS
 .DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp

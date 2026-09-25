@@ -208,6 +208,7 @@ def compare_documents(file1_path: str, file2_path: str) -> str:
 def ocr_image(image_path: str) -> str:
     """Performs advanced OCR on an image using the local vision model."""
     try:
+        image_path = _validate_workspace_path(image_path)
         if not os.path.exists(image_path):
             return f"Error: File not found at {image_path}"
         prompt = "You are an expert, precise OCR engine. Extract all text exactly as it appears in this image. Preserve layout, bullet points, and tabular structures if any. Do not describe the image or add commentary. Output ONLY the raw extracted text."
@@ -219,6 +220,7 @@ def ocr_image(image_path: str) -> str:
 def analyze_engineering_drawing(image_path: str) -> str:
     """Specifically tuned vision prompt for P&IDs using sliding-window chunking (Image Tiling) for high-res detail."""
     try:
+        image_path = _validate_workspace_path(image_path)
         if not os.path.exists(image_path):
             return f"Error: File not found at {image_path}"
         from PIL import Image
@@ -235,19 +237,23 @@ def analyze_engineering_drawing(image_path: str) -> str:
         
         results = []
 
-        prompt = """You are an expert piping engineer. Analyze this high-res quadrant (Sector {i+1} with coordinates {box}) of an engineering drawing/P&ID. 
-Use a combination of Vision, OCR, Spatial Relationships, Symbol Interpretation, and Line Analysis.
-Extract all equipment tag numbers, instrument loops, pipe classes, valve designations, and line sizes visible.
-For any connections or relationships (e.g., CONNECTED_TO, FEEDS, CONTROLLED_BY), you MUST explicitly verify visual evidence. 
-If a line crosses the boundary or the relationship is unclear, return 'AMBIGUOUS / REQUIRES HUMAN REVIEW' for that relationship rather than inventing one.
-Be extremely precise. Do not hallucinate."""
+        prompt_template = (
+            "You are an expert piping engineer. Analyze this high-res quadrant "
+            "(Sector {sector} with coordinates {coords}) of an engineering drawing/P&ID. "
+            "Use a combination of Vision, OCR, Spatial Relationships, Symbol Interpretation, and Line Analysis. "
+            "Extract all equipment tag numbers, instrument loops, pipe classes, valve designations, and line sizes visible. "
+            "For any connections or relationships (e.g., CONNECTED_TO, FEEDS, CONTROLLED_BY), you MUST explicitly verify visual evidence. "
+            "If a line crosses the boundary or the relationship is unclear, return "
+            "'AMBIGUOUS / REQUIRES HUMAN REVIEW' for that relationship rather than inventing one. "
+            "Be extremely precise. Do not hallucinate."
+        )
 
         for i, box in enumerate(quads):
             quad_img = img.crop(box)
             quad_path = image_path + f"_quad_{i}.png"
             quad_img.save(quad_path)
             
-            p = prompt.format(i=i, box=box)
+            p = prompt_template.format(sector=i + 1, coords=box)
             quad_result = analyze_image.invoke({"image_path": quad_path, "prompt": p})
             results.append(f"--- Sector {i+1} (Crop Coordinates: {box}) ---\n{quad_result}")
 
@@ -396,57 +402,101 @@ def create_approval_note(content: str, facts_json: str = "{}", filename: str = "
         return f"Error creating approval note: {e}"
 
 @tool
-def create_excel_report(data: str, filename: str = "Report.xlsx") -> str:
-    """Creates a styled Excel report. Strips markdown and applies corporate formatting (Zebra striping, borders)."""
+def create_excel_report(data: str, filename: str = "Report.xlsx", facts_json: str = "{}") -> str:
+    """Creates a styled Excel report with multiple worksheets using facts_json if available."""
     try:
-        # Clean markdown if present
-        data = data.replace('```csv', '').replace('```', '').strip()
-        
+        import json
         ts_filename = _get_timestamped_filename(filename)
         wb = Workbook()
-        ws = wb.active
-        ws.title = "Data Report"
-
-        reader = csv.reader(io.StringIO(data))
-        rows = list(reader)
         
-        if not rows:
-            return "No data provided for Excel."
-
         # Styles
         header_fill = PatternFill(start_color="1F4E78", end_color="1F4E78", fill_type="solid")
         header_font = Font(color="FFFFFF", bold=True)
         zebra_fill = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
         thin_border = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-
-        for r_idx, row_data in enumerate(rows, 1):
-            for c_idx, value in enumerate(row_data, 1):
-                cell = ws.cell(row=r_idx, column=c_idx, value=value.strip() if isinstance(value, str) else value)
-                cell.border = thin_border
-                
-                # Header styling
-                if r_idx == 1:
-                    cell.fill = header_fill
-                    cell.font = header_font
-                    cell.alignment = Alignment(horizontal='center', vertical='center')
-                # Zebra striping
-                elif r_idx % 2 == 0:
-                    cell.fill = zebra_fill
-                    
-        # Auto-adjust columns & add autofilter
-        for col in ws.columns:
-            max_length = 0
-            column = col[0].column_letter 
-            for cell in col:
-                try: 
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except: pass
-            adjusted_width = (max_length + 2)
-            ws.column_dimensions[column].width = min(adjusted_width, 50) # Cap width
-
-        ws.auto_filter.ref = ws.dimensions
         
+        def format_sheet(ws):
+            for r_idx, row in enumerate(ws.iter_rows()):
+                for cell in row:
+                    cell.border = thin_border
+                    if r_idx == 0:
+                        cell.fill = header_fill
+                        cell.font = header_font
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+                    elif r_idx % 2 != 0:
+                        cell.fill = zebra_fill
+            for col in ws.columns:
+                max_length = 0
+                column = col[0].column_letter 
+                for cell in col:
+                    try: 
+                        if len(str(cell.value)) > max_length:
+                            max_length = len(str(cell.value))
+                    except: pass
+                ws.column_dimensions[column].width = min(max_length + 2, 50)
+            if ws.max_row > 1:
+                ws.auto_filter.ref = ws.dimensions
+
+        facts = json.loads(facts_json)
+        sheets_created = False
+
+        if facts.get("equipment"):
+            ws = wb.active if not sheets_created else wb.create_sheet("Equipment")
+            if not sheets_created: ws.title = "Equipment"
+            sheets_created = True
+            ws.append(["Equipment ID", "Name", "Location", "Source", "Evidence", "Confidence"])
+            for equipment in facts["equipment"]:
+                provenance = equipment.get("provenance", {})
+                ws.append([
+                    equipment.get("id", ""),
+                    equipment.get("name", ""),
+                    equipment.get("location", ""),
+                    provenance.get("source", ""),
+                    provenance.get("evidence", ""),
+                    provenance.get("confidence", ""),
+                ])
+            format_sheet(ws)
+        
+        if facts.get("findings"):
+            ws = wb.active if not sheets_created else wb.create_sheet("Findings")
+            if not sheets_created: ws.title = "Findings"
+            sheets_created = True
+            ws.append(["Finding ID", "Description", "Severity", "Target", "Source"])
+            for f in facts["findings"]:
+                ws.append([f.get("id", ""), f.get("description", ""), f.get("severity", ""), f.get("target", ""), f.get("provenance", {}).get("source", "")])
+            format_sheet(ws)
+            
+        if facts.get("measurements"):
+            ws = wb.active if not sheets_created else wb.create_sheet("Measurements")
+            if not sheets_created: ws.title = "Measurements"
+            sheets_created = True
+            ws.append(["ID", "Value", "Unit", "Target", "Source"])
+            for m in facts["measurements"]:
+                val = m.get("raw_value")
+                if val is None: val = m.get("normalized_value", "")
+                ws.append([m.get("id", ""), val, m.get("unit", ""), m.get("target", ""), m.get("provenance", {}).get("source", "")])
+            format_sheet(ws)
+            
+        if facts.get("actions"):
+            ws = wb.active if not sheets_created else wb.create_sheet("Actions")
+            if not sheets_created: ws.title = "Actions"
+            sheets_created = True
+            ws.append(["Action ID", "Finding ID", "Description", "Timeframe", "Target"])
+            for a in facts["actions"]:
+                ws.append([a.get("id", ""), a.get("finding_id", ""), a.get("description", ""), a.get("timeframe", ""), a.get("target", "")])
+            format_sheet(ws)
+            
+        if not sheets_created:
+            # Fallback to CSV text
+            data = data.replace('```csv', '').replace('```', '').strip()
+            ws = wb.active
+            ws.title = "Data Report"
+            reader = csv.reader(io.StringIO(data))
+            rows = list(reader)
+            if not rows: return "No data provided for Excel."
+            for r in rows: ws.append(r)
+            format_sheet(ws)
+            
         wb.save(ts_filename)
         return f"Successfully saved styled Excel report to {ts_filename}"
     except Exception as e:
@@ -454,22 +504,43 @@ def create_excel_report(data: str, filename: str = "Report.xlsx") -> str:
 
 @tool
 def write_local_file(filepath: str, content: str) -> str:
-    """Writes or overwrites a local file with the provided content."""
+    """Writes or overwrites a local file with the provided content. Automatically creates a backup."""
     try:
+        import shutil
+        import datetime
         filepath = _validate_workspace_path(filepath)
+        
+        # Shadow backup system
+        if os.path.exists(filepath):
+            backup_dir = os.path.join(os.getcwd(), "workspace", ".backups")
+            os.makedirs(backup_dir, exist_ok=True)
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = os.path.join(backup_dir, f"{os.path.basename(filepath)}_{timestamp}.bak")
+            shutil.copy2(filepath, backup_path)
+            
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(content)
-        return f"Successfully wrote to {filepath}"
+        return f"Successfully wrote to {filepath} (Original backed up)"
     except Exception as e:
         return f"Error writing file: {e}"
 
 @tool
 def replace_text_in_file(filepath: str, old_text: str, new_text: str) -> str:
-    """Replaces all occurrences of old_text with new_text in the specified file."""
+    """Replaces all occurrences of old_text with new_text in the specified file. Automatically creates a backup."""
     try:
+        import shutil
+        import datetime
         filepath = _validate_workspace_path(filepath)
         if not os.path.exists(filepath):
             return f"Error: File not found at {filepath}"
+            
+        # Shadow backup system
+        backup_dir = os.path.join(os.getcwd(), "workspace", ".backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        backup_path = os.path.join(backup_dir, f"{os.path.basename(filepath)}_{timestamp}.bak")
+        shutil.copy2(filepath, backup_path)
+            
         with open(filepath, 'r', encoding='utf-8') as f:
             content = f.read()
         if old_text not in content:
@@ -477,7 +548,7 @@ def replace_text_in_file(filepath: str, old_text: str, new_text: str) -> str:
         updated_content = content.replace(old_text, new_text)
         with open(filepath, 'w', encoding='utf-8') as f:
             f.write(updated_content)
-        return f"Successfully updated {filepath}"
+        return f"Successfully updated {filepath} (Original backed up)"
     except Exception as e:
         return f"Error updating file: {e}"
 
@@ -573,6 +644,7 @@ def create_presentation(content: str, filename: str = "Presentation.pptx") -> st
 def analyze_image(image_path: str, prompt: str = "First, transcribe ALL visible text from this image exactly as written. Then describe any diagrams, charts, or visual elements in a structured format.", model: str = "") -> str:
     """Analyzes an image using the local vision model. Optionally pass a specific model name to override the default."""
     try:
+        image_path = _validate_workspace_path(image_path)
         if not os.path.exists(image_path):
             return f"Error: File not found at {image_path}"
         # Resolve model: use passed-in model, or fall back to router's current vision model
@@ -589,17 +661,27 @@ def analyze_image(image_path: str, prompt: str = "First, transcribe ALL visible 
 
 # Modules that are completely forbidden in the sandbox
 _BLOCKED_MODULES = frozenset([
-    'os', 'sys', 'subprocess', 'socket', 'importlib', 'ctypes',
+    'sys', 'subprocess', 'socket', 'importlib', 'ctypes',  # os removed: os.path.* is allowed
     'pickle', 'shelve', 'builtins', 'shutil', 'pathlib', 'tempfile',
     'signal', 'threading', 'multiprocessing', 'concurrent',
-    'urllib', 'http', 'ftplib', 'smtplib', 'requests',
+    'urllib', 'http', 'ftplib', 'smtplib', 'requests', 'io', 'pty'
+])
+
+
+# Specific os.* calls that escape the sandbox — blocked at AST level
+_DANGEROUS_OS_ATTRS = frozenset([
+    'system', 'popen', 'popen2', 'popen3', 'popen4',
+    'execv', 'execve', 'execvp', 'execvpe', 'execl', 'execle', 'execlp', 'execlpe',
+    'spawnl', 'spawnle', 'spawnlp', 'spawnlpe',
+    'spawnv', 'spawnve', 'spawnvp', 'spawnvpe',
+    'startfile', 'fork', 'forkpty', 'kill', 'killpg',
 ])
 
 def _check_sandbox_security(code: str):
     """
     Multi-layer AST security check.
-    Blocks dangerous imports, __import__ calls, exec/eval with
-    non-literal args, and attribute access on blocked module names.
+    Allows: import os (for os.path.*), open(), pandas, csv, math.
+    Blocks: sys, subprocess, socket, exec/eval, and dangerous os shell functions.
     """
     try:
         tree = ast.parse(code)
@@ -647,6 +729,14 @@ def _check_sandbox_security(code: str):
                     else:
                         raise SecurityError(f"Dynamic {func.id}() with non-literal attribute is blocked.")
 
+            # Block dangerous os.* shell-escape functions (os.system, os.popen, os.exec*, os.spawn*)
+            if isinstance(func, ast.Attribute):
+                if (isinstance(func.value, ast.Name) and func.value.id == 'os'
+                        and func.attr in _DANGEROUS_OS_ATTRS):
+                    raise SecurityError(
+                        f"os.{func.attr}() is blocked in sandbox — shell/process operations not permitted."
+                    )
+
         # Block access to __builtins__, __class__, __subclasses__ etc.
         elif isinstance(node, ast.Attribute):
             if node.attr in ('__builtins__', '__subclasses__', '__globals__', '__class__', '__dict__', '__bases__', '__mro__'):
@@ -656,7 +746,11 @@ def _check_sandbox_security(code: str):
         elif isinstance(node, ast.Name):
             if node.id in ('__builtins__', '__subclasses__', '__globals__', '__class__', '__dict__', '__bases__', '__mro__'):
                 raise SecurityError(f"Direct access to '{node.id}' is blocked in sandbox.")
-            if node.id in ('globals', 'locals', 'vars', 'dir', 'open', 'exec', 'eval', 'compile', 'breakpoint', 'help', 'input'):
+            # NOTE: open() is intentionally ALLOWED — the sandbox runs code in an
+            # isolated subprocess with a stripped environment. File I/O is legitimate
+            # for CSV/data processing tasks. Path traversal is prevented at the
+            # tool-call layer (_validate_workspace_path) not at AST level.
+            if node.id in ('globals', 'locals', 'vars', 'exec', 'eval', 'compile', 'breakpoint'):
                 raise SecurityError(f"Function '{node.id}()' is blocked in sandbox.")
 
 

@@ -1,6 +1,6 @@
 import os
 import json
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import FAISS  # TODO: migrate when langchain-faiss publishes stable API
 from langchain_ollama import OllamaEmbeddings
 from langchain_core.documents import Document
 from model_router import router

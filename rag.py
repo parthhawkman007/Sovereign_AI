@@ -3,7 +3,7 @@ import re
 import json
 import logging
 import pickle
-from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores import FAISS  # TODO: migrate when langchain-faiss publishes stable API
 from langchain_ollama import OllamaEmbeddings
 from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
@@ -210,8 +210,15 @@ class LocalKnowledgeBase:
         with open(self.graph_file, 'w') as f:
             json.dump(entity_graph, f)
 
-        # Build FAISS
-        vectorstore = FAISS.from_documents(docs, self.embeddings)
+        # Build FAISS in batches to prevent WinError 10054
+        batch_size = 50
+        vectorstore = None
+        for i in range(0, len(docs), batch_size):
+            batch = docs[i:i + batch_size]
+            if vectorstore is None:
+                vectorstore = FAISS.from_documents(batch, self.embeddings)
+            else:
+                vectorstore.add_documents(batch)
         vectorstore.save_local(self.persist_dir)
         print(f"[{self.domain.upper()}] Knowledge base saved to {self.persist_dir}")
 
@@ -227,9 +234,10 @@ class LocalKnowledgeBase:
         try:
             faiss_results = vectorstore.similarity_search(query, k=k, filter=filter_dict)
         except Exception:
-             faiss_results = vectorstore.similarity_search(query, k=k) # Fallback if filter not supported natively by this FAISS version
+             faiss_results = vectorstore.similarity_search(query, k=k * 5) # Retrieve more for post-filtering
              if user_role != 'admin':
                  faiss_results = [doc for doc in faiss_results if doc.metadata.get("role", "engineer") == "engineer"]
+             faiss_results = faiss_results[:k]
 
         # BM25 Search
         bm25_results = []

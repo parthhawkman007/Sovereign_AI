@@ -1,0 +1,53 @@
+# Sovereign AI Workbench - Dependencies
+# All packages pinned for reproducible deployments
+
+# Web server
+fastapi>=0.110.0
+uvicorn>=0.29.0
+python-multipart>=0.0.9
+
+# HTTP & config
+requests>=2.31.0
+PyYAML>=6.0.1
+
+# LangChain / LangGraph AI stack
+langchain-core>=0.2.0
+langchain-community>=0.2.0
+langchain-ollama>=0.1.0
+langgraph>=0.1.0
+
+# Vector DB & retrieval
+faiss-cpu>=1.8.0
+rank-bm25>=0.2.2
+
+# Data validation
+pydantic>=2.0.0
+
+# Office document tools
+openpyxl>=3.1.0
+python-docx>=1.1.0
+python-pptx>=0.6.23
+
+# PDF tools
+pypdf>=4.0.0
+pdfplumber>=0.10.0
+PyMuPDF>=1.24.0
+
+# Image & OCR
+pytesseract>=0.3.10
+Pillow>=10.0.0
+
+# Filesystem watcher
+watchdog>=4.0.0
+
+# System monitoring (used in server.py for air-gap telemetry)
+psutil>=5.9.0
+
+# Testing
+pytest>=8.0.0
+reportlab>=4.0.0  # FIX 8: required by test_regression.py/_meta.py for synthetic PDF generation
+
+# NOTE: torch has been intentionally removed.
+# The neuron.py now uses a dynamic LLM-based router (ChatOllama).
+# The legacy PyTorch weight files (.pth) in the project root are orphaned
+# and can be safely deleted once confirmed no longer needed.

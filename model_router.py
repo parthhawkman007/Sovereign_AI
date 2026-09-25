@@ -24,23 +24,36 @@ class ModelRouter:
         return []
 
     def get_reasoning_model(self, fallback=None):
-        fallback = fallback or self.config.get("reasoning", "phi4-mini")
+        fallback = fallback or self.config.get("reasoning", "phi4-mini:latest")
         for m in self.models:
-            if "phi4" in m or "llama3" in m or "mixtral" in m:
+            if m.lower() == fallback.lower():
+                return m
+        for m in self.models:
+            if "phi4" in m.lower():
                 return m
         return fallback
 
     def get_coding_model(self, fallback=None):
         fallback = fallback or self.config.get("coding", "qwen2.5-coder:3b")
         for m in self.models:
-            if "coder" in m or "starcoder" in m or "deepseek-coder" in m:
+            if m.lower() == fallback.lower():
                 return m
-        return self.get_reasoning_model(fallback=fallback)
+        for m in self.models:
+            if "qwen" in m.lower() and "coder" in m.lower():
+                return m
+        # Do not silently replace a coding task with the reasoning model.
+        return fallback
 
     def get_vision_model(self, fallback=None):
         fallback = fallback or self.config.get("vision", "granite3.2-vision:2b")
+        # Honour the configured vision model before accepting another compatible
+        # installed model.  This keeps document extraction deterministic when
+        # multiple vision models are present.
         for m in self.models:
-            if "granite3.2-vision" in m or "granite" in m or "vision" in m:
+            if m.lower() == fallback.lower():
+                return m
+        for m in self.models:
+            if "granite" in m.lower():
                 return m
         return fallback
 
@@ -52,7 +65,11 @@ class ModelRouter:
         return fallback
 
     def get_document_model(self, fallback=None):
-        return self.get_reasoning_model(fallback=fallback)
+        # Documents and scans share the vision/extraction model.  Falling back
+        # to a reasoning model here caused document workflows to drift away
+        # from the model selected for the vision pipeline.
+        fallback = fallback or self.config.get("document") or self.config.get("vision", "granite3.2-vision:2b")
+        return self.get_vision_model(fallback=fallback)
 
     def resolve_model(self, requested_name: str) -> str:
         if not requested_name:
@@ -60,27 +77,17 @@ class ModelRouter:
             
         req = str(requested_name).strip().lower()
 
-        # Semantic overrides to protect specific model roles
-        if req == "qwen" or "coder" in req or "code" in req:
+        # Semantic role locks: a request can resolve only to the model family
+        # that owns the corresponding capability.
+        if "qwen" in req or "coder" in req or "code" in req:
             return self.get_coding_model()
-        if "vision" in req or "granite" in req or "image" in req:
+        if "vision" in req or "granite" in req or "image" in req or "document" in req:
             return self.get_vision_model()
-        if req == "document":
-            return self.get_document_model()
-        if req == "phi" or "reason" in req:
+        if "phi" in req or "reason" in req or "general" in req:
             return self.get_reasoning_model()
 
-        # 1. Exact match
-        for m in self.models:
-            if m.lower() == req:
-                return m
-                
-        # 2. Match without tag or prefix match
-        base_req = req.split(':')[0]
-        for m in self.models:
-            if m.lower().split(':')[0] == base_req or req in m.lower():
-                return m
-            
+        # Unknown aliases are always treated as general reasoning rather than
+        # allowing an arbitrary installed model to cross a role boundary.
         return self.get_reasoning_model()
 
     def get_model_descriptions(self):

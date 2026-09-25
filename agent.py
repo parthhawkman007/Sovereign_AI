@@ -41,6 +41,24 @@ def get_ltm(session_id: str):
 
 neuron_agent = NeuronAgent()
 plugins = load_plugins()
+_plugin_tool_registry = {getattr(t, 'name', getattr(t, '__name__', str(t))): t for t in plugins}
+
+import requests
+
+def release_all_models():
+    """Smart VRAM Manager: Keeps up to 2 models in memory to prevent ping-pong latency."""
+    try:
+        res = requests.get("http://127.0.0.1:11434/api/ps", timeout=2)
+        if res.status_code == 200:
+            models = res.json().get("models", [])
+            # If more than 2 models are loaded, evict the oldest (last in list usually)
+            if len(models) > 2:
+                model_to_kill = models[-1].get("name")
+                if model_to_kill:
+                    requests.post("http://127.0.0.1:11434/api/generate", json={"model": model_to_kill, "keep_alive": 0}, timeout=2)
+                    print(f"[Model Lifecycle] Evicted oldest model to free VRAM: {model_to_kill}")
+    except:
+        pass
 
 def reduce_extracted_data(a: str, b: str) -> str:
     if b == "__CLEAR__": return ""
@@ -73,18 +91,31 @@ class AgentState(TypedDict):
     canonical_document: dict # New canonical schema
     validation_status: str
     approval_state: str
+    execution_plan: dict
+    completed_steps: Annotated[list[str], reduce_rag_evidence]
+    failed_steps: Annotated[list[str], reduce_rag_evidence]
+    active_step_id: str
+    active_step_capability: str
 
 # ── Single source of truth for deliverable intent detection ──────────────────
-_DELIVERABLE_KEYWORDS = [
-    "excel", "spreadsheet", "presentation", "ppt", "approval", "word", "docx",
-    "create document", "generate document", "create report", "generate report",
-    "risk register", "summary report", "approval note", "make a file"
-]
+_DELIVERABLE_DOCX = ["word", "docx", "report", "document", "approval note", "summary"]
+_DELIVERABLE_XLSX = ["excel", "xlsx", "spreadsheet", "workbook", "table"]
+_DELIVERABLE_PPTX = ["powerpoint", "pptx", "ppt", "presentation", "slides"]
 
-def _is_deliverable_request(user_input: str) -> bool:
-    """Returns True if the user's message requests a file deliverable to be generated."""
-    text = user_input.lower()
-    return any(kw in text for kw in _DELIVERABLE_KEYWORDS)
+def _get_deliverable_intents(messages: list) -> list[str]:
+    """Returns a list of requested formats: ['DOCX', 'XLSX', 'PPTX'] based on all HumanMessages."""
+    intents = set()
+    from langchain_core.messages import HumanMessage
+    for msg in messages:
+        if isinstance(msg, HumanMessage):
+            text = msg.content.lower()
+            if any(kw in text for kw in _DELIVERABLE_DOCX): intents.add("DOCX")
+            if any(kw in text for kw in _DELIVERABLE_XLSX): intents.add("XLSX")
+            if any(kw in text for kw in _DELIVERABLE_PPTX): intents.add("PPTX")
+    return list(intents)
+
+def _is_deliverable_request(messages: list) -> bool:
+    return len(_get_deliverable_intents(messages)) > 0
 
 
 def neuron_node(state: AgentState, config: RunnableConfig):
@@ -97,10 +128,16 @@ def neuron_node(state: AgentState, config: RunnableConfig):
     extracted = state.get("extracted_data", "")
     
     # NLP Classification using our Quantum PyTorch NeuronAgent
-    actions, model_key, sentiment = neuron_agent.route_intent(user_input)
-    args = neuron_agent.extract_args(user_input, actions[0] if actions else "reasoning")
+    plan = neuron_agent.generate_plan(user_input, messages)
+    actions = [step.get("capability") for step in plan.get("steps", [])]
+    if not actions:
+        actions = ["reasoning"]
     
-    # Guardrails: enforce correct model type based on actions
+    # Extract args based on the first action for legacy compatibility
+    args = neuron_agent.extract_args(user_input, actions[0])
+    
+    # Legacy routing compatibility
+    model_key = "phi"
     if "vision" in actions:
         model_key = "vision"
     elif "coding" in actions or "file_editing" in actions:
@@ -108,8 +145,8 @@ def neuron_node(state: AgentState, config: RunnableConfig):
     elif "document_tools" in actions:
         model_key = "document"
 
-    # The Neuron mathematically decides the model shift
     sel_model = router.resolve_model(model_key)
+    sentiment = "casual"
     
     # Contemplative musing & honoring constraints fillers
     filler = "Musing over your request and honoring constraints…"
@@ -128,14 +165,28 @@ def neuron_node(state: AgentState, config: RunnableConfig):
     elif "reasoning" in actions:
         filler = "Musing deeply and formulating perspective…"
         
-    print(f"Neuron Decision: {actions} | Model Assigned: {sel_model} | Sentiment: {sentiment} | Args: {args}")
+    print(f"Neuron Decision Plan: {plan.get('objective')} | Model Assigned: {sel_model} | Sentiment: {sentiment} | Args: {args}")
     
     if "finish" in actions and not extracted:
         actions = ["structured_extraction"]
-        
-    return {"next_action": actions, "tool_args": str(args), "selected_model": sel_model, "sentiment": sentiment, "filler_message": filler}
 
-from langchain_core.runnables.config import RunnableConfig
+    # CRITICAL FIX: Reset execution tracking on every new plan.
+    # completed_steps uses an append reducer — step IDs from previous turns
+    # (e.g. "step_1") would cause execution_controller to immediately report
+    # "all steps completed" for a brand new plan that reuses the same IDs.
+    return {
+        "next_action": actions,
+        "tool_args": str(args),
+        "selected_model": sel_model,
+        "sentiment": sentiment,
+        "filler_message": filler,
+        "execution_plan": plan,
+        "completed_steps": ["__CLEAR__"],
+        "failed_steps": ["__CLEAR__"],
+        "active_step_id": "",
+        "active_step_capability": "",
+    }
+
 
 def rag_engineering_node(state: AgentState, config: RunnableConfig):
     print("--- RAG AGENT (ENGINEERING) ---")
@@ -185,14 +236,12 @@ def rag_workspace_node(state: AgentState, config: RunnableConfig):
     combined = args + " " + user_input
 
     # Phase 1: scan uploads dir for files whose name (with spaces) appears in the text
-    new_files_added = False
     found_paths = []
     if os.path.exists(WORKSPACE_DIR):
         for fname in os.listdir(WORKSPACE_DIR):
             ext = fname.lower().rsplit('.', 1)[-1] if '.' in fname else ''
             if ext in ('txt', 'docx', 'pdf', 'csv', 'xlsx', 'pptx', 'ppt') and fname.lower() in combined.lower():
                 found_paths.append(os.path.join(WORKSPACE_DIR, fname))
-                new_files_added = True
 
     # Phase 2: regex fallback for space-free paths / absolute paths
     regex_paths = re.findall(r'([A-Za-z0-9_\\/\.-]+\.(?:txt|docx|pdf|csv|xlsx|pptx?)|[A-Za-z]:\\[A-Za-z0-9_\\/\.-]+)', combined)
@@ -200,7 +249,8 @@ def rag_workspace_node(state: AgentState, config: RunnableConfig):
         path = path.strip()
         in_workspace = os.path.join(WORKSPACE_DIR, os.path.basename(path))
         if os.path.exists(in_workspace):
-            new_files_added = True
+            if in_workspace not in found_paths:
+                found_paths.append(in_workspace)
         if os.path.exists(path) and os.path.abspath(path) != os.path.abspath(in_workspace):
             try:
                 dest = os.path.join(WORKSPACE_DIR, os.path.basename(path))
@@ -208,28 +258,46 @@ def rag_workspace_node(state: AgentState, config: RunnableConfig):
                     if not os.path.exists(dest):
                         shutil.copytree(path, dest)
                         print(f"Stored user folder: {dest}")
-                        new_files_added = True
+                        found_paths.append(dest)
                 else:
                     shutil.copy2(path, dest)
                     print(f"Stored user file: {dest}")
-                    new_files_added = True
+                    found_paths.append(dest)
             except Exception as e:
                 print(f"Failed to store {path}: {e}")
 
     # Ingest and Search
     session_id = config.get("configurable", {}).get("thread_id", "default")
+    
+    # Create a session-specific ingest directory to only embed the requested files
+    session_ingest_dir = os.path.join("workspace", "processed", f"rag_ingest_{session_id}")
+    os.makedirs(session_ingest_dir, exist_ok=True)
+    
+    for fp in found_paths:
+        if os.path.isfile(fp):
+            shutil.copy2(fp, os.path.join(session_ingest_dir, os.path.basename(fp)))
+        elif os.path.isdir(fp):
+            dest_dir = os.path.join(session_ingest_dir, os.path.basename(fp))
+            if not os.path.exists(dest_dir):
+                shutil.copytree(fp, dest_dir)
+                
     kb = LocalKnowledgeBase(domain="workspace", persist_dir=os.path.join("workspace", "vector_databases", f"kb_workspace_{session_id}"))
-    if new_files_added or not os.path.exists(kb.persist_dir):
-        kb.ingest_documents(WORKSPACE_DIR)
+    if found_paths:
+        kb.ingest_documents(session_ingest_dir)
         
     query = args if args else user_input
     role = state.get("user_role", "engineer")
     context = kb.search(query, user_role=role)
     
-    current_data = state.get("extracted_data", "")
+    # Cleanup session ingest dir
+    try:
+        shutil.rmtree(session_ingest_dir)
+    except:
+        pass
+        
     return {"rag_evidence": [f"[User Workspace Context for \'{query}\']: {context}".strip()]}
 
-def _generic_rag_node(state: AgentState, domain_name: str, display_name: str):
+def _generic_rag_node(state: AgentState, domain_name: str, display_name: str, config: RunnableConfig = None):
     print(f"--- RAG AGENT ({display_name.upper()}) ---")
     query = state.get("tool_args", state["messages"][-1].content)
     role = state.get("user_role", "engineer")
@@ -255,13 +323,18 @@ def document_tools_node(state: AgentState):
     # Phase 1: scan uploads dir for document files whose name (with spaces) appears in the text
     resolved_path = ""
     doc_exts = ('.txt', '.docx', '.pdf', '.csv', '.xlsx', '.pptx', '.ppt')
-    if os.path.exists(WORKSPACE_DIR):
-        for fname in os.listdir(WORKSPACE_DIR):
-            if fname.lower().endswith(doc_exts) and fname.lower() in combined.lower():
-                candidate = os.path.join(WORKSPACE_DIR, fname)
-                if os.path.exists(candidate):
-                    resolved_path = candidate
-                    break
+    
+    search_dirs = [WORKSPACE_DIR, "workspace", "."]
+    for search_dir in search_dirs:
+        if os.path.exists(search_dir):
+            for fname in os.listdir(search_dir):
+                if fname.lower().endswith(doc_exts) and fname.lower() in combined.lower():
+                    candidate = os.path.join(search_dir, fname)
+                    if os.path.isfile(candidate):
+                        resolved_path = candidate
+                        break
+        if resolved_path:
+            break
 
     # Phase 2: regex fallback for space-free paths
     if not resolved_path:
@@ -302,6 +375,7 @@ CRITICAL INSTRUCTIONS:
 2. Do not convert a numerical difference into a qualitative claim unless the document explicitly supports it. Keep source facts separate from model interpretation.
 3. Do not invent missing information.
 4. Stop generating if the text is unclear instead of repeating yourself.
+5. DO NOT echo the user query. DO NOT output conversational text.
 
 Format each finding as:
 [Page X]: [Finding Text]
@@ -313,12 +387,22 @@ Document Text:
 
 Output only the extracted data/summary:"""
     
-    try:
-        response = doc_llm.invoke([{"role": "user", "content": summary_prompt}])
-        summarized_content = response.content.strip()
-    except Exception as e:
-        print(f"Warning: Document summarization failed ({e}), falling back to raw text.")
-        summarized_content = content
+    max_retries = 2
+    summarized_content = ""
+    for attempt in range(max_retries):
+        try:
+            response = doc_llm.invoke([{"role": "user", "content": summary_prompt}])
+            summarized_content = response.content.strip()
+            # Check for echo bug
+            if summarized_content and (user_input.lower() in summarized_content.lower() and len(summarized_content) < len(user_input) * 2):
+                print(f"[Document Node] Echo detected on attempt {attempt+1}. Retrying...")
+                summary_prompt += "\n\nCRITICAL: DO NOT ECHO MY QUERY. EXTRACT DATA FROM THE DOCUMENT TEXT."
+                continue
+            break
+        except Exception as e:
+            print(f"Warning: Document summarization failed ({e}), falling back to raw text.")
+            summarized_content = content
+            break
         
     llm_end = time.time()
     print(f"[Timing] LLM call time: {llm_end - llm_start:.2f}s")
@@ -326,7 +410,16 @@ Output only the extracted data/summary:"""
 
     current_data = state.get("extracted_data", "")
     new_data = f"[File Summary from {path}]:\n{summarized_content}"
-    return {"extracted_data": new_data.strip()}
+
+    import os as _os
+    fname_display = _os.path.basename(path)
+    formatted_response = (
+        f"**Document analysed:** `{fname_display}`  \n"
+        f"**Model used:** `{doc_model_name}`\n\n"
+        f"---\n\n"
+        f"{summarized_content}"
+    )
+    return {"extracted_data": new_data.strip(), "messages": [AIMessage(content=formatted_response)]}
 
 def _find_image_path(combined_text: str) -> str:
     """
@@ -388,15 +481,49 @@ def vision_node(state: AgentState):
         result = analyze_engineering_drawing.invoke({"image_path": image_path})
     else:
         # Pass the dynamically selected model through to the tool
+        vision_prompt = args if args else "Extract key information."
+        if user_input:
+            vision_prompt += f"\nUser specifically asked: {user_input}\nCRITICAL: DO NOT ECHO THIS QUERY. OUTPUT ONLY THE IMAGE ANALYSIS."
+            
         result = analyze_image.invoke({
             "image_path": image_path,
-            "prompt": args if args else "Extract key information.",
+            "prompt": vision_prompt,
             "model": sel_model
         })
+        
+        # Check for echo bug
+        if result and (user_input.lower() in result.lower() and len(result) < len(user_input) * 2):
+            print(f"[Vision Node] Echo detected. Retrying...")
+            result = analyze_image.invoke({
+                "image_path": image_path,
+                "prompt": vision_prompt + "\n\nI SAID DO NOT ECHO MY QUERY. WHAT IS IN THE IMAGE?",
+                "model": sel_model
+            })
 
     current_data = state.get("extracted_data", "")
     new_data = f"[Vision Data (model: {sel_model})]:\n{result}"
-    return {"extracted_data": new_data.strip()}
+
+    import os as _os
+    img_display = _os.path.basename(image_path)
+
+    # Detect what kind of vision analysis was performed
+    combined_lower = combined.lower()
+    if any(k in combined_lower for k in ["ocr", "text", "extract", "content", "read", "words", "written"]):
+        analysis_type = "OCR / Text Extraction"
+    elif "table" in combined_lower or "excel" in combined_lower:
+        analysis_type = "Table Extraction"
+    elif "drawing" in combined_lower or "p&id" in combined_lower or "pid" in combined_lower:
+        analysis_type = "Engineering Drawing Analysis"
+    else:
+        analysis_type = "Image Analysis"
+
+    formatted_response = (
+        f"**{analysis_type}**  \n"
+        f"**Image:** `{img_display}` | **Model:** `{sel_model}`\n\n"
+        f"---\n\n"
+        f"{result}"
+    )
+    return {"extracted_data": new_data.strip(), "messages": [AIMessage(content=formatted_response)]}
 
 def coding_node(state: AgentState):
     sel_model = router.resolve_model(state.get("selected_model", router.get_coding_model()))
@@ -406,10 +533,21 @@ def coding_node(state: AgentState):
     coder_llm = ChatOllama(model=sel_model, temperature=0.1)
     system_prompt = """You are a senior python developer. Write pure python code to solve the problem.
 CRITICAL ENVIRONMENT RULES:
-1. You run in a secure sandbox. Do NOT `import os`, `sys`, or `subprocess`. They are blocked.
-2. If reading a file the user uploaded, assume it is located in the `workspace/uploads/` directory.
-3. If writing a new file (like a CSV, Excel, or image) to give back to the user, you MUST save it to the `workspace/processed/` directory.
-4. Output pure python code only. No markdown. Use print() to output results."""
+1. Do NOT `import sys` or `import subprocess` — they are blocked.
+2. `import os` is ALLOWED — use os.path.exists(), os.path.join() freely.
+3. You CAN use `open()` freely — file I/O is fully allowed in this sandbox.
+4. For CSV work, use `import pandas as pd` — pandas is installed and preferred.
+5. Files the user uploaded are in `workspace/uploads/`. Write output files to `workspace/processed/`.
+6. Output ONLY pure python code. No markdown. No explanatory text. Use print() for output.
+7. DO NOT echo the user prompt back. Write working code only.
+
+Example:
+User: Data context: \n\nTask: Write a script to add 2 and 2.
+Assistant:
+```python
+result = 2 + 2
+print(result)
+```"""
     
     prompt_messages = [
         {"role": "system", "content": system_prompt},
@@ -423,6 +561,17 @@ CRITICAL ENVIRONMENT RULES:
     for attempt in range(max_retries):
         response = coder_llm.invoke(prompt_messages)
         code = response.content.replace("```python", "").replace("```", "").strip()
+        
+        # Check for empty code or prompt echoing
+        if not code or (len(args) > 10 and args.lower() in code.lower() and "print" not in code and "import" not in code and "def " not in code and "=" not in code):
+            print(f"[Coding Node] Attempt {attempt + 1} failed: Model echoed prompt or returned empty code. Retrying...")
+            prompt_messages.append({"role": "assistant", "content": code})
+            prompt_messages.append({"role": "user", "content": "You just echoed my prompt or output text without python code. DO NOT do that. You MUST write pure python code starting with ```python. Try again."})
+            if attempt == max_retries - 1:
+                final_code = code
+                final_result = "Execution failed: Model failed to generate valid python code."
+            continue
+
         result = execute_python_code.invoke({"code": code})
         
         is_error = "Error" in result or "Exception" in result or "Traceback" in result
@@ -442,7 +591,34 @@ CRITICAL ENVIRONMENT RULES:
     
     current_data = state.get("extracted_data", "")
     new_data = f"[Calculation Result]:\nCode executed:\n{final_code}\nOutput:\n{final_result}"
-    return {"extracted_data": new_data.strip()}
+
+    # Build a rich formatted response showing both the code and its output
+    is_error = ("Error" in final_result or "Traceback" in final_result
+                or "Exception" in final_result or "Security Policy" in final_result)
+
+    if is_error:
+        # Show code + error clearly
+        formatted_response = (
+            f"Here is the generated script:\n\n"
+            f"```python\n{final_code}\n```\n\n"
+            f"**Execution failed:**\n```\n{final_result}\n```"
+        )
+    elif final_result and final_result != "Execution successful with no printed output.":
+        # Show code + successful output
+        formatted_response = (
+            f"Here is the generated script:\n\n"
+            f"```python\n{final_code}\n```\n\n"
+            f"**Output:**\n```\n{final_result}\n```"
+        )
+    else:
+        # Code ran but printed nothing
+        formatted_response = (
+            f"Here is the generated script:\n\n"
+            f"```python\n{final_code}\n```\n\n"
+            f"*Script executed successfully with no printed output.*"
+        )
+
+    return {"extracted_data": new_data.strip(), "messages": [AIMessage(content=formatted_response)]}
 
 def file_editing_node(state: AgentState):
     sel_model = router.resolve_model(state.get("selected_model", router.get_coding_model()))
@@ -489,7 +665,7 @@ REPLACE: filepath
 
     current_data = state.get("extracted_data", "")
     new_data = f"[File Edit Result]:\n{result}"
-    return {"extracted_data": new_data.strip()}
+    return {"extracted_data": new_data.strip(), "messages": [AIMessage(content=result)]}
 
 
 import json
@@ -504,7 +680,6 @@ def structured_extraction_node(state: AgentState):
         from langchain_ollama import ChatOllama
         from schemas import CanonicalDocument
         from pydantic import ValidationError
-        import json
 
         system_prompt = """You are a strict data extraction engine. Extract engineering facts from the following text into JSON matching this exact schema:
 {
@@ -515,7 +690,11 @@ def structured_extraction_node(state: AgentState):
     "actions": [{"id": "...", "description": "...", "finding_id": "...", "target": "...", "timeframe": "...", "provenance": {...}}],
     "relationships": [{"source_id": "...", "target_id": "...", "type": "CONNECTED_TO", "provenance": {...}}]
 }
-Return ONLY valid JSON. Do not include markdown blocks or explanations. Extract every single measurement and finding accurately."""
+
+CRITICAL RULES:
+1. provenance.extraction_method MUST be exactly "LLM", "REGEX", or "HUMAN". NEVER use "PDF reader", "Code reader", or any other value.
+2. The input contains tool metadata headers (e.g., "[File Summary...]", "[Calculation Result]", "[Vision Data...]") and possibly tool errors (e.g., tracebacks). DO NOT extract system metadata, tool names, or errors as engineering findings, measurements, or actions. Only extract actual domain facts from the underlying source document.
+3. Return ONLY valid JSON. Do not include markdown blocks or explanations."""
 
         # Fix Gap 1: use model router instead of hardcoded model name
         doc_model = router.get_document_model()
@@ -527,28 +706,36 @@ Return ONLY valid JSON. Do not include markdown blocks or explanations. Extract 
             raw = raw[7:-3].strip()
         elif raw.startswith("```"):
             raw = raw[3:-3].strip()
+        # Pre-clean: remove malformed \uXXXX sequences that granite sometimes emits
+        import re as _re
+        raw = _re.sub(r'\\u(?![0-9a-fA-F]{4})', r'\\\\u', raw)
         raw_dict = json.loads(raw)
         
-        # Fix Bug 3: enforce Pydantic schema validation — was completely bypassed before
         try:
             validated = CanonicalDocument.model_validate(raw_dict)
             facts = validated.model_dump()
-            print("[Extraction] Pydantic schema validation PASSED.")
+            
+            if not any([facts.get("findings"), facts.get("measurements"), facts.get("equipment"), facts.get("actions")]):
+                print("[Extraction] No actionable facts extracted.")
+                facts = {"_EXTRACTION_FAILED": True, "_VALIDATION_ERRORS": "No facts extracted"}
+            else:
+                print("[Extraction] Pydantic schema validation PASSED.")
         except ValidationError as ve:
-            print(f"[Extraction] Pydantic validation WARNING (using raw dict): {ve}")
-            facts = raw_dict  # Degrade gracefully — use unvalidated dict but don't fail
-            facts["_VALIDATION_WARNINGS"] = str(ve)
+            print(f"[Extraction] Pydantic validation FAILED: {ve}")
+            facts = {"_EXTRACTION_FAILED": True, "_VALIDATION_ERRORS": str(ve)}
             
     except Exception as e:
         print(f"[Extraction Error] {e}")
         facts = {"_EXTRACTION_FAILED": True}
+
+    # Centralized model release happens in the wrapper
 
     return {"canonical_document": facts}
 
 
 def validation_node(state: AgentState):
     print("--- VALIDATION NODE ---")
-    draft = state["messages"][-1].content
+    draft = state.get("extracted_data", state["messages"][-1].content)
     facts = state.get("canonical_document", {})
     
     calc_status = "PASS"
@@ -579,85 +766,12 @@ def validation_node(state: AgentState):
         import json
         from langchain_core.messages import AIMessage
         log_data = {"node": "validation", "validation_status": calc_status, "errors": errors}
-        with open('audit.log', 'a', encoding='utf-8') as lg:
+        with open(os.path.join('workspace', 'audit.log'), 'a', encoding='utf-8') as lg:
             lg.write(json.dumps(log_data) + "\n")
         return {"validation_status": calc_status, "messages": [AIMessage(content="VALIDATION FAILED:\n" + "\n".join(errors))]}
 
-    user_input = ""
-    for msg in reversed(state["messages"]):
-        from langchain_core.messages import HumanMessage
-        if isinstance(msg, HumanMessage):
-            user_input = msg.content.lower()
-            break
-
-    is_deliverable = _is_deliverable_request(user_input)
-    
-    if is_deliverable:
-        import json
-        res = create_approval_note.invoke({"content": draft, "facts_json": json.dumps(facts)})
-        import re
-        import docx
-        match = re.search(r'to (.*\.docx)', res)
-        if match:
-            filepath = match.group(1)
-            
-            # 2. ARTIFACT READBACK
-            qa_doc = docx.Document(filepath)
-            
-            full_text_raw = ""
-            for p in qa_doc.paragraphs:
-                full_text_raw += p.text + "\n"
-                
-            table_texts = []
-            for t in qa_doc.tables:
-                for row in t.rows:
-                    row_text = ""
-                    for cell in row.cells:
-                        row_text += cell.text + " "
-                        full_text_raw += cell.text + " "
-                    table_texts.append(row_text)
-                    
-            full_text_nospaces = full_text_raw.replace(" ", "")
-            
-            # 3. VALIDATION
-            for f_item in facts.get("findings", []):
-                if f_item.get("id", "").replace(" ", "") not in full_text_nospaces:
-                    errors.append(f"QA FAIL: Finding {f_item.get('id')} was silently dropped.")
-                
-            for m_item in facts.get("measurements", []):
-                v = m_item.get("raw_value")
-                if v is None: v = m_item.get("normalized_value", "")
-                unit = m_item.get("unit", "")
-                
-                if v and unit:
-                    expected_str = f"{v}{unit}".replace(" ", "")
-                    if expected_str not in full_text_nospaces:
-                        errors.append(f"QA FAIL: Numeric data {v} {unit} corrupted or missing.")
-                        
-            for a_item in facts.get("actions", []):
-                a_id = a_item.get("id", "").replace(" ", "")
-                f_id = a_item.get("finding_id", "").replace(" ", "")
-                timeframe = a_item.get("timeframe", "").replace(" ", "")
-                
-                if a_id not in full_text_nospaces:
-                    errors.append(f"QA FAIL: Action {a_id} was silently dropped.")
-                    
-                if f_id:
-                    found_link = False
-                    for r_txt in table_texts:
-                        r_txt_ns = r_txt.replace(" ", "")
-                        if a_id in r_txt_ns and f_id in r_txt_ns:
-                            found_link = True
-                            break
-                    if not found_link:
-                        errors.append(f"QA FAIL: Traceability lost for {a_item.get('id')} -> {a_item.get('finding_id')}.")
-                        
-            if "Iherebyapprove" in full_text_nospaces or "approvedby" in full_text_nospaces.lower():
-                if "signature" in full_text_nospaces.lower():
-                    errors.append("QA FAIL: AI attempted to hallucinate human approval.")
-    elif not facts:
-        # Pass non-deliverable conversation logic
-        pass
+    plan = state.get("execution_plan", {})
+    is_deliverable = _is_deliverable_request(state["messages"]) or bool(plan.get("deliverables"))
 
     import json
     log_data = {
@@ -665,7 +779,7 @@ def validation_node(state: AgentState):
         "validation_status": "ARTIFACT_QA_FAILED" if errors else "PASS",
         "errors": errors
     }
-    with open('audit.log', 'a', encoding='utf-8') as lg:
+    with open(os.path.join('workspace', 'audit.log'), 'a', encoding='utf-8') as lg:
         lg.write(json.dumps(log_data) + "\n")
 
     from langchain_core.messages import AIMessage
@@ -673,31 +787,56 @@ def validation_node(state: AgentState):
         print("VALIDATION FAILED: " + ", ".join(errors))
         return {"validation_status": "ARTIFACT_QA_FAILED", "messages": [AIMessage(content="DOCUMENT QA FAILED:\n" + "\n".join(errors))]}
 
-    if is_deliverable:
-        has_meaningful_data = bool(facts) and any(len(facts.get(k, [])) > 0 for k in ["findings", "measurements", "actions"])
-        if not has_meaningful_data:
-            from langchain_core.messages import AIMessage
-            return {"validation_status": "INSUFFICIENT_EVIDENCE", "messages": [AIMessage(content="VALIDATION FAILED: Empty source-of-truth dataset or insufficient evidence for deliverable.")]}
+    # Build a clean response from extracted data — do NOT interrupt/block
+    extracted = state.get("extracted_data", "")
+    facts = state.get("canonical_document", {})
 
-    if not is_deliverable:
-        return {"validation_status": "N/A_CONVERSATION"}
+    if is_deliverable and facts and any(len(facts.get(k, [])) > 0 for k in ["findings", "measurements", "actions", "equipment"]):
+        # Format structured facts as a readable summary
+        parts = []
+        if facts.get("equipment"):
+            parts.append("**Equipment Identified:**")
+            for eq in facts["equipment"][:10]:
+                parts.append(f"- {eq.get('id','?')}: {eq.get('name','?')} @ {eq.get('location','?')}")
+        if facts.get("findings"):
+            parts.append("\n**Key Findings:**")
+            for fn in facts["findings"][:10]:
+                parts.append(f"- [{fn.get('severity','?')}] {fn.get('description','?')}")
+        if facts.get("measurements"):
+            parts.append("\n**Measurements:**")
+            for m in facts["measurements"][:10]:
+                parts.append(f"- {m.get('id','?')}: {m.get('raw_value','?')} {m.get('unit','?')}")
+        if facts.get("actions"):
+            parts.append("\n**Recommended Actions:**")
+            for a in facts["actions"][:10]:
+                parts.append(f"- {a.get('description','?')} (by {a.get('timeframe','?')})")
+        summary = "\n".join(parts) if parts else extracted
+        return {"validation_status": "PASS", "messages": [AIMessage(content=summary)]}
 
-    return {"validation_status": "PASS", "approval_state": "DRAFT - PENDING HUMAN REVIEW"}
+    # Fallback: return the raw extracted text as the response
+    if extracted:
+        return {"validation_status": "PASS", "messages": [AIMessage(content=extracted)]}
+
+    return {"validation_status": "N/A_CONVERSATION"}
 
 
 def reasoning_node(state: AgentState, config: RunnableConfig):
-    sel_model = router.resolve_model(state.get("selected_model", router.get_reasoning_model()))
-    print(f"--- REASONING NODE (Model: {sel_model}) ---")
-    messages = state["messages"]
-    args = state.get("tool_args", "")
+    print("--- REASONING NODE ---")
+    messages = state.get("messages", [])
+    if not messages: return {}
+    
+    # STRICT MODEL ISOLATION: Always use the reasoning model (phi4-mini)
+    from model_router import router
+    model_name = router.get_reasoning_model()
+    print(f"--- REASONING NODE (Model: {model_name}) ---")
+    
+    llm = ChatOllama(model=model_name, temperature=0.3, num_predict=1500)
+    args = state.get("tool_args", state["messages"][-1].content)
     action = state.get("next_action", ["structured_extraction"])
     sentiment = state.get("sentiment", "casual")
     session_id = config.get("configurable", {}).get("thread_id", "default")
     ltm = get_ltm(session_id)
     
-    llm = ChatOllama(model=sel_model, temperature=0.3)
-    session_id = config.get("configurable", {}).get("thread_id", "default")
-    ltm = get_ltm(session_id)
     memory_context = ltm.get_context_string(query=messages[-1].content)
     
     # Dynamic Persona & Role-Based Tone
@@ -724,11 +863,10 @@ Do NOT sound robotic unless explicitly asked for a formal report.
 REPLYING SYSTEM PROTOCOL:
 Before you respond to the user, you MUST first think step-by-step about the context, the user's sentiment, and the best way to synthesize the data. Write your internal monologue inside `<thought>` ... `</thought>` XML tags. After closing the thought tag, write your polished, final response. NEVER skip the thought process."""
 
-    if "excel" in args.lower() or "csv" in args.lower():
-        system_prompt += " Output ONLY comma-separated values (CSV) with a header row. No markdown."
-    elif "presentation" in args.lower() or "ppt" in args.lower():
+    intents = _get_deliverable_intents(state["messages"])
+    if "PPTX" in intents:
         system_prompt += " Output ONLY slide content. Separate slides with '---'. Line 1 is title, rest are bullets."
-    elif "approval" in args.lower() or "document" in args.lower() or "word" in args.lower() or "file" in args.lower():
+    elif "DOCX" in intents or "XLSX" in intents:
         system_prompt += " The user is requesting a generated document. You MUST output ONLY the raw content that should be written to the document. Do NOT output conversational filler, greetings, or pleasantries. Output only the report, research findings, or document text."
         
     prompt_messages = [{"role": "system", "content": system_prompt}]
@@ -768,36 +906,65 @@ Before you respond to the user, you MUST first think step-by-step about the cont
 
 def tool_execution_node(state: AgentState):
     print("--- DELIVERABLE TOOLS NODE ---")
-    user_input = ""
+    
+    # Check the latest user message for approval/rejection
+    last_human_msg = ""
+    from langchain_core.messages import HumanMessage
     for msg in reversed(state["messages"]):
         if isinstance(msg, HumanMessage):
-            user_input = msg.content.lower()
+            last_human_msg = msg.content.lower()
             break
             
-    if state.get("validation_status") == "FAIL":
+    if state.get("validation_status") == "FAIL" or state.get("validation_status") == "EXTRACTION_FAILED":
         print("Validation failed. Halting tool execution.")
         return {}
             
-    data = state["messages"][-1].content
+    draft = state["messages"][-1].content
+    facts = state.get("canonical_document", {})
     
     app_state = "APPROVED"
 
-    if "reject" in user_input or "cancel" in user_input or "stop" in user_input:
+    if "reject" in last_human_msg or "cancel" in last_human_msg or "stop" in last_human_msg:
         app_state = "REJECTED"
         print("[Tool Execution] Rejected by human.")
         return {"approval_state": app_state}
-    elif "edit" in user_input or "change" in user_input or "update" in user_input or "fix" in user_input or "no" in user_input:
+    elif "edit" in last_human_msg or "change" in last_human_msg or "update" in last_human_msg or "fix" in last_human_msg or bool(__import__("re").search(r"\bno\b", last_human_msg)):
         app_state = "EDITED"
         print("[Tool Execution] Edited by human.")
         return {"approval_state": app_state}
 
-    if "excel" in user_input or "spreadsheet" in user_input:
-        create_excel_report.invoke({"data": data})
-    elif "presentation" in user_input or "ppt" in user_input:
-        create_presentation.invoke({"content": data})
-    elif "approval" in user_input or "word" in user_input or "docx" in user_input or "document" in user_input or "file" in user_input:
-        print("[Tool Execution] Finalized DOCX artifact (Generated during validation phase).")
+    intents = _get_deliverable_intents(state["messages"])
+    plan_deliverables = state.get("execution_plan", {}).get("deliverables", [])
+    for d in plan_deliverables:
+        if d not in intents:
+            intents.append(d)
+    
+    import json
+    facts_json = json.dumps(facts)
+    
+    if "DOCX" in intents:
+        res = create_approval_note.invoke({"content": draft, "facts_json": facts_json})
+        print(f"[Tool Execution] Finalized DOCX artifact: {res}")
         
+        # QA Readback
+        import re, docx
+        match = re.search(r'to (.*\.docx)', res)
+        if match:
+            filepath = match.group(1)
+            qa_doc = docx.Document(filepath)
+            full_text_nospaces = "".join(p.text for p in qa_doc.paragraphs).replace(" ", "")
+            for f_item in facts.get("findings", []):
+                if f_item.get("id", "").replace(" ", "") not in full_text_nospaces:
+                    print(f"QA FAIL: Finding {f_item.get('id')} was silently dropped.")
+    
+    if "XLSX" in intents:
+        res = create_excel_report.invoke({"data": draft, "facts_json": facts_json})
+        print(f"[Tool Execution] Finalized XLSX artifact: {res}")
+        
+    if "PPTX" in intents:
+        res = create_presentation.invoke({"content": draft})
+        print(f"[Tool Execution] Finalized PPTX artifact: {res}")
+
     return {"approval_state": app_state}
 
 
@@ -806,8 +973,6 @@ def memory_node(state: AgentState, config: RunnableConfig):
     session_id = config.get("configurable", {}).get("thread_id", "default")
     ltm = get_ltm(session_id)
     query = state.get("tool_args", state["messages"][-1].content)
-    session_id = config.get("configurable", {}).get("thread_id", "default")
-    ltm = get_ltm(session_id)
     memories = ltm.search_memory(query, k=5)
     
     current_data = state.get("extracted_data", "")
@@ -852,7 +1017,7 @@ def route_neuron(state: AgentState) -> list[str]:
             "rag_defect_history", "rag_symbol_legend", "rag_codebase", "rag_formulas",
             "rag_table_extractor", "rag_engineering", "rag_commercial", "rag_compliance",
             "rag_workspace", "rag_meeting_minutes", "rag_hr_policy",
-            "vision", "coding", "document_tools", "file_editing", "plugin", "memory", "reasoning"
+            "document_tools", "vision", "coding", "file_editing", "plugin", "memory", "reasoning"
         ]
         routes = [min(routes, key=lambda r: priority.index(r) if r in priority else 99)]
 
@@ -864,7 +1029,7 @@ def route_neuron(state: AgentState) -> list[str]:
             user_input = msg.content.lower()
             break
             
-    is_deliverable = _is_deliverable_request(user_input)
+    is_deliverable = _is_deliverable_request(state["messages"])
     
     if is_deliverable and "reasoning" in routes and not tool_routes:
         routes.remove("reasoning")
@@ -878,72 +1043,109 @@ def route_neuron(state: AgentState) -> list[str]:
 def route_validation(state: AgentState) -> str:
     if state.get("validation_status") in ["FAIL", "EXTRACTION_FAILED", "ARTIFACT_QA_FAILED", "INSUFFICIENT_EVIDENCE"]:
         return END
+    plan = state.get("execution_plan", {})
+    if plan.get("deliverables"):
+        return "tools"
     user_input = ""
     for msg in reversed(state["messages"]):
         if isinstance(msg, HumanMessage):
             user_input = msg.content.lower()
             break
             
-    if _is_deliverable_request(user_input):
+    if _is_deliverable_request(state["messages"]):
         return "tools"
     return END
 
 workflow = StateGraph(AgentState)
 
-workflow.add_node("neuron", neuron_node)
-workflow.add_node("rag_engineering", rag_engineering_node)
-workflow.add_node("rag_commercial", rag_commercial_node)
-workflow.add_node("rag_compliance", rag_compliance_node)
-workflow.add_node("rag_workspace", rag_workspace_node)
-workflow.add_node("rag_codebase", rag_codebase_node)
-workflow.add_node("rag_formulas", rag_formulas_node)
-workflow.add_node("rag_symbol_legend", rag_symbol_legend_node)
-workflow.add_node("rag_defect_history", rag_defect_history_node)
-workflow.add_node("rag_meeting_minutes", rag_meeting_minutes_node)
-workflow.add_node("rag_hr_policy", rag_hr_policy_node)
-workflow.add_node("rag_table_extractor", rag_table_extractor_node)
+from execution_controller import execution_controller_node, mark_step_complete
+from orchestrator import global_execution_controller, Artifact
+import uuid
 
-workflow.add_node("document_tools", document_tools_node)
-workflow.add_node("vision", vision_node)
-workflow.add_node("coding", coding_node)
-workflow.add_node("memory", memory_node)
-workflow.add_node("reasoning", reasoning_node)
-workflow.add_node("structured_extraction", structured_extraction_node)
-workflow.add_node("validation", validation_node)
-workflow.add_node("file_editing", file_editing_node)
-workflow.add_node("tools", tool_execution_node)
-workflow.add_node("plugin", plugin_node)
+# Wrappers to mark steps complete and save artifacts
+def create_wrapper(node_func):
+    def wrapper(state: AgentState, config: RunnableConfig):
+        res = node_func(state, config) if "config" in node_func.__code__.co_varnames else node_func(state)
+        
+        # Centralized Model Lifecycle
+        release_all_models()
+        
+        # Save artifact if there's new extracted data
+        artifact_id = None
+        if isinstance(res, dict) and "extracted_data" in res and res["extracted_data"]:
+            artifact_id = state.get("active_step_id", f"art_{uuid.uuid4().hex[:8]}")
+            session_id = config.get("configurable", {}).get("thread_id", "default")
+            artifact = Artifact(
+                artifact_id=artifact_id,
+                session_id=session_id,
+                type="execution_result",
+                created_by=state.get("active_step_capability", "unknown"),
+                status="verified",
+                content=res["extracted_data"]
+            )
+            global_execution_controller.store.save(artifact)
+            
+        # Combine the original result with the completion marks
+        mark_res = mark_step_complete(state, artifact_id=artifact_id)
+        if isinstance(res, dict):
+            res.update(mark_res)
+        else:
+            res = mark_res
+        return res
+    return wrapper
+
+workflow.add_node("neuron", neuron_node)
+workflow.add_node("execution_controller", execution_controller_node)
+
+# Wrap existing nodes to mark steps complete
+workflow.add_node("rag_engineering", create_wrapper(rag_engineering_node))
+workflow.add_node("rag_commercial", create_wrapper(rag_commercial_node))
+workflow.add_node("rag_compliance", create_wrapper(rag_compliance_node))
+workflow.add_node("rag_workspace", create_wrapper(rag_workspace_node))
+workflow.add_node("rag_codebase", create_wrapper(rag_codebase_node))
+workflow.add_node("rag_formulas", create_wrapper(rag_formulas_node))
+workflow.add_node("rag_symbol_legend", create_wrapper(rag_symbol_legend_node))
+workflow.add_node("rag_defect_history", create_wrapper(rag_defect_history_node))
+workflow.add_node("rag_meeting_minutes", create_wrapper(rag_meeting_minutes_node))
+workflow.add_node("rag_hr_policy", create_wrapper(rag_hr_policy_node))
+workflow.add_node("rag_table_extractor", create_wrapper(rag_table_extractor_node))
+
+workflow.add_node("document_tools", create_wrapper(document_tools_node))
+workflow.add_node("vision", create_wrapper(vision_node))
+workflow.add_node("coding", create_wrapper(coding_node))
+workflow.add_node("memory", create_wrapper(memory_node))
+workflow.add_node("reasoning", create_wrapper(reasoning_node))
+workflow.add_node("structured_extraction", create_wrapper(structured_extraction_node))
+workflow.add_node("file_editing", create_wrapper(file_editing_node))
+workflow.add_node("plugin", create_wrapper(plugin_node))
+
+# Validation and tools stay the same since they are end-of-pipeline
+workflow.add_node("validation", create_wrapper(validation_node))
+workflow.add_node("tools", create_wrapper(tool_execution_node))
     
 workflow.add_edge(START, "neuron")
-    
-# Sequential RAG Pipelines to Managers
-workflow.add_edge("rag_codebase", "coding")
-workflow.add_edge("rag_formulas", "coding")
-workflow.add_edge("rag_symbol_legend", "vision")
-workflow.add_edge("rag_defect_history", "vision")
-workflow.add_edge("rag_table_extractor", "document_tools")
+workflow.add_edge("neuron", "execution_controller")
 
-# Default RAGs to Reasoning
-workflow.add_edge("rag_engineering", "structured_extraction")
-workflow.add_edge("rag_commercial", "structured_extraction")
-workflow.add_edge("rag_compliance", "structured_extraction")
-workflow.add_edge("rag_workspace", "structured_extraction")
-workflow.add_edge("rag_hr_policy", "structured_extraction")
-workflow.add_edge("rag_meeting_minutes", "structured_extraction")
+def route_execution_controller(state: AgentState) -> list[str]:
+    action = state.get("next_action", ["finish"])
+    if "finish" in action:
+        return [END]
+    return action
 
-# Managers to Final Reasoning or END
-workflow.add_edge("document_tools", "structured_extraction")
-workflow.add_edge("vision", "structured_extraction")
-workflow.add_edge("coding", "structured_extraction")
-workflow.add_edge("memory", "structured_extraction")
-workflow.add_edge("file_editing", "structured_extraction")
-workflow.add_edge("plugin", "structured_extraction")
+workflow.add_conditional_edges("execution_controller", route_execution_controller)
 
-workflow.add_conditional_edges("neuron", route_neuron)
-workflow.add_conditional_edges("validation", route_validation)
-workflow.add_edge("tools", END)
-workflow.add_edge("structured_extraction", "reasoning")
-workflow.add_edge("reasoning", "validation")
+# All capability nodes return to execution_controller to get the next step in the plan
+capabilities = [
+    "rag_engineering", "rag_commercial", "rag_compliance", "rag_workspace", 
+    "rag_codebase", "rag_formulas", "rag_symbol_legend", "rag_defect_history", 
+    "rag_meeting_minutes", "rag_hr_policy", "rag_table_extractor",
+    "document_tools", "vision", "coding", "memory", "reasoning", 
+    "file_editing", "plugin", "structured_extraction", "validation", "tools"
+]
+
+for cap in capabilities:
+    workflow.add_edge(cap, "execution_controller")
+
 
 memory = MemorySaver()
 

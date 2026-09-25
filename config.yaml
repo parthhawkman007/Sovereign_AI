@@ -1,5 +1,6 @@
 models:
-  reasoning: "phi4-mini"
+  reasoning: "phi4-mini:latest"
   coding: "qwen2.5-coder:3b"
-  vision: "gemma3:4b"
+  vision: "granite3.2-vision:2b"
+  document: "granite3.2-vision:2b"
   embedding: "nomic-embed-text"
